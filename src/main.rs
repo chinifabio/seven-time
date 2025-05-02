@@ -1,15 +1,18 @@
 use anyhow::{Ok, Result};
 use chrono::{DateTime, Timelike, Utc};
 use embedded_svc::http::{Headers, Method};
+use esp_idf_svc::hal::ledc::config::TimerConfig;
+use esp_idf_svc::hal::ledc::{LedcDriver, LedcTimerDriver, Resolution};
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_svc::io::{Read, Write};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::sntp::SyncStatus;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, hal::prelude::*, http::server::EspHttpServer};
+use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
-use std::{collections::HashMap, thread::sleep, time::Duration};
+use std::{thread::sleep, time::Duration};
 
 use esp_idf_svc::http::server::Configuration as HttpServerConfiguration;
 use esp_idf_svc::wifi::Configuration as WifiConfiguration;
@@ -23,7 +26,7 @@ const DEFAULT_SSID: &str = "SevenTime";
 const DEFAULT_PASS: &str = "3D Printing <3";
 
 const MIN_ANGLE: u32 = 0;
-const MAX_ANGLE: u32 = 180;
+const MAX_ANGLE: u32 = 270;
 
 const HTML_PAGE: &str = include_str!("../html/index.html");
 const MAX_LEN: usize = 128;
@@ -81,28 +84,52 @@ fn main() -> Result<()> {
         log::info!("Starting AP mode...");
     }
     wifi.wait_netif_up()?;
+    log::info!(
+        "Wifi connected with IP: {:?}",
+        wifi.wifi().sta_netif().get_ip_info()?
+    );
 
     let server_config = HttpServerConfiguration::default();
     let mut server = EspHttpServer::new(&server_config)?;
 
     match &wifi_configuration {
         WifiConfiguration::Client(_) => {
-            let mut servos = vec![
-                Digit::new(25),
-                Digit::new(26),
-                Digit::new(27),
-                Digit::new(14),
+            let timer_driver = LedcTimerDriver::new(
+                peripherals.ledc.timer0,
+                &TimerConfig::default()
+                    .frequency(50.Hz())
+                    .resolution(Resolution::Bits14),
+            )?;
+
+            let mut servos = [
+                Digit::new(LedcDriver::new(
+                    peripherals.ledc.channel0,
+                    &timer_driver,
+                    peripherals.pins.gpio33,
+                )?),
+                Digit::new(LedcDriver::new(
+                    peripherals.ledc.channel1,
+                    &timer_driver,
+                    peripherals.pins.gpio25,
+                )?),
+                Digit::new(LedcDriver::new(
+                    peripherals.ledc.channel2,
+                    &timer_driver,
+                    peripherals.pins.gpio26,
+                )?),
+                Digit::new(LedcDriver::new(
+                    peripherals.ledc.channel3,
+                    &timer_driver,
+                    peripherals.pins.gpio27,
+                )?),
             ];
 
             let ntp_time = esp_idf_svc::sntp::EspSntp::new_default()?;
-            // Synchronize NTP
             println!("Synchronizing with NTP Server");
             while ntp_time.get_sync_status() != SyncStatus::Completed {}
             println!("Time Sync Completed");
 
-            let clock_state = Arc::new(Mutex::new(ClockState::new()));
-
-            // Pass clock_state to the server for the /set_timer endpoint
+            let clock_state = Arc::new(Mutex::new(ClockState::default()));
             let clock_state_clone = clock_state.clone();
             build_time_server(&mut server, clock_state_clone)?;
 
@@ -113,15 +140,16 @@ fn main() -> Result<()> {
                 match state.mode {
                     ClockMode::Clock => {
                         let start = SystemTime::now();
-                        let dt_now_utc: DateTime<Utc> = start.clone().into();
+                        let dt_now_utc: DateTime<Utc> = start.into();
 
-                        let digits = vec![
+                        let digits = [
                             dt_now_utc.hour() / 10,
                             dt_now_utc.hour() % 10,
                             dt_now_utc.minute() / 10,
                             dt_now_utc.minute() % 10,
                         ];
 
+                        log::info!("Current time: {:?}", dt_now_utc);
                         for (digit, servo) in digits.iter().zip(servos.iter_mut()) {
                             servo.set_digit(*digit as u8);
                         }
@@ -140,13 +168,14 @@ fn main() -> Result<()> {
                                     Duration::new(0, 0)
                                 };
 
-                                let digits = vec![
+                                let digits = [
                                     remaining.as_secs() / 60 / 10,
                                     remaining.as_secs() / 60 % 10,
                                     (remaining.as_secs() % 60) / 10,
                                     (remaining.as_secs() % 60) % 10,
                                 ];
 
+                                log::info!("Remaining time: {:?}", remaining);
                                 for (digit, servo) in digits.iter().zip(servos.iter_mut()) {
                                     servo.set_digit(*digit as u8);
                                 }
@@ -177,6 +206,12 @@ fn main() -> Result<()> {
     }
 }
 
+#[derive(Default, Debug, Clone, Deserialize)]
+struct SetCredentialData {
+    ssid: String,
+    pass: String,
+}
+
 fn build_ap_server(
     server: &mut EspHttpServer<'_>,
     nvs: Arc<Mutex<EspNvs<NvsDefault>>>,
@@ -187,7 +222,8 @@ fn build_ap_server(
             let len = request.content_len().unwrap_or(0) as usize;
 
             if len > MAX_LEN {
-                request.into_status_response(413)?
+                request
+                    .into_status_response(413)?
                     .write_all("Request too big".as_bytes())?;
                 return Ok(());
             }
@@ -195,28 +231,14 @@ fn build_ap_server(
             let mut buf = vec![0; len];
             request.read_exact(&mut buf)?;
             request.into_ok_response()?;
+            let data: SetCredentialData = serde_json::from_slice(&buf)?;
 
-            let body_str = std::str::from_utf8(&buf)?;
-            let data: HashMap<&str, &str> = body_str
-                .split('&')
-                .filter_map(|param| param.split_once('='))
-                .collect();
-            log::info!("{data:?}");
-            if let Some((ssid, pass)) = data
-                .get("ssid")
-                .and_then(|&ssid| data.get("pass").map(|&pass| (ssid, pass)))
-            {
-                log::info!("Setting SSID: {} and PASS: {}", ssid, pass);
-                let mut lock = nvs
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Failed to lock NVS"))?;
-                lock.set_str(EEPROM_KEY_SSID, ssid)?;
-                lock.set_str(EEPROM_KEY_PASS, pass)?;
-                Ok(())
-            } else {
-                log::error!("Invalid parameters");
-                Err(anyhow::anyhow!("Invalid parameters"))
-            }
+            let mut lock = nvs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock credentials NVS"))?;
+            lock.set_str(EEPROM_KEY_SSID, data.ssid.as_str())?;
+            lock.set_str(EEPROM_KEY_PASS, data.pass.as_str())?;
+            Ok(())
         })?
         .fn_handler("/", Method::Get, move |request| {
             let html = HTML_PAGE;
@@ -228,14 +250,28 @@ fn build_ap_server(
     Ok(())
 }
 
-pub struct Digit {
-    pin: i32,
+pub struct Digit<'a> {
     counter: u8,
+    driver: LedcDriver<'a>,
+    min: u32,
+    max: u32,
 }
 
-impl Digit {
-    pub fn new(pin: i32) -> Self {
-        Self { pin, counter: 0 }
+impl<'a> Digit<'a> {
+    fn map(x: u32, in_min: u32, in_max: u32, out_min: u32, out_max: u32) -> u32 {
+        (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+    }
+
+    pub fn new(driver: LedcDriver<'a>) -> Self {
+        let max_duty = driver.get_max_duty();
+        let min = max_duty * 25 / 1000;
+        let max = max_duty * 75 / 1000;
+        Self {
+            driver,
+            counter: 0,
+            min,
+            max,
+        }
     }
 
     pub fn tick(&mut self) {
@@ -243,12 +279,10 @@ impl Digit {
         self.rotate_servo();
     }
 
-    fn rotate_servo(&self) {
-        // Map counter (0..=9) to angle (MIN_ANGLE..=MAX_ANGLE)
+    fn rotate_servo(&mut self) {
         let angle = MIN_ANGLE + ((MAX_ANGLE - MIN_ANGLE) * self.counter as u32) / 9;
-        // Here you would add the code to actually set the servo PWM to the angle
-        // For example: set_servo_angle(self.pin, angle);
-        log::info!("Rotating servo on pin {} to angle {}", self.pin, angle);
+        let duty = Self::map(angle, MIN_ANGLE, MAX_ANGLE, self.min, self.max);
+        self.driver.set_duty(duty).unwrap();
     }
 
     pub fn set_digit(&mut self, digit: u8) {
@@ -258,54 +292,55 @@ impl Digit {
     }
 }
 
+#[derive(Default, Debug, Clone, Deserialize)]
+struct SetTimerData {
+    minutes: u64,
+}
+
 fn build_time_server(
     server: &mut EspHttpServer<'_>,
-    _clock_state: Arc<Mutex<ClockState>>,
+    clock_state: Arc<Mutex<ClockState>>,
 ) -> Result<()> {
-    server.fn_handler("/set_timer", Method::Post, move |request| {
-        let mut state = _clock_state.lock().unwrap();
+    server.fn_handler("/set_timer", Method::Post, move |mut request| {
+        let len = request.content_len().unwrap_or(0) as usize;
 
-        let query: HashMap<&str, &str> = request
-            .uri()
-            .split_once("?")
-            .map(|(_, query)| {
-                query
-                    .split("&")
-                    .map(|param| param.split_once("=").unwrap())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(minutes) = query.get("minutes").and_then(|m| m.parse::<u64>().ok()) {
-            state.set_timer(Duration::from_secs(minutes * 60));
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Invalid parameters"))
+        if len > MAX_LEN {
+            request
+                .into_status_response(413)?
+                .write_all("Request too big".as_bytes())?;
+            return Ok(());
         }
+
+        let mut buf = vec![0; len];
+        request.read_exact(&mut buf)?;
+        request.into_ok_response()?;
+        let data: SetTimerData = serde_json::from_slice(&buf)?;
+
+        log::info!("Setting timer for {} minutes", data.minutes);
+        let duration = Duration::from_secs(data.minutes * 60);
+        let mut state = clock_state.lock().unwrap();
+        state.set_timer(duration);
+
+        Ok(())
     })?;
     Ok(())
 }
 
+#[derive(Default)]
 pub struct ClockState {
     mode: ClockMode,
     timer_duration: Option<Duration>,
     start_time: Option<SystemTime>,
 }
 
+#[derive(Default)]
 pub enum ClockMode {
+    #[default]
     Clock,
     Timer,
 }
 
 impl ClockState {
-    pub fn new() -> Self {
-        Self {
-            mode: ClockMode::Clock,
-            timer_duration: None,
-            start_time: None,
-        }
-    }
-
     pub fn set_timer(&mut self, duration: Duration) {
         self.mode = ClockMode::Timer;
         self.timer_duration = Some(duration);
