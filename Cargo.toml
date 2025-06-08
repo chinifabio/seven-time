@@ -26,6 +26,7 @@ experimental = ["esp-idf-svc/experimental"]
 anyhow = "1.0.95"
 chrono = "0.4.40"
 embedded-svc = "0.28.1"
+esp-idf-hal = "0.45.2"
 esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 log = "0.4.25"
 serde = "1.0.219"
